@@ -194,6 +194,7 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 		mux.HandleFunc("/", s.serveSearchBox)
 		mux.HandleFunc("/about", s.serveAbout)
 		mux.HandleFunc("/print", s.servePrint)
+		mux.HandleFunc("/file", s.serveFile)
 	}
 	if s.RPC {
 		mux.Handle("/api/", http.StripPrefix("/api", zjson.JSONServer(traceAwareSearcher{s.Searcher})))
@@ -348,6 +349,13 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 
 func (s *Server) servePrint(w http.ResponseWriter, r *http.Request) {
 	err := s.servePrintErr(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusTeapot)
+	}
+}
+
+func (s *Server) serveFile(w http.ResponseWriter, r *http.Request) {
+	err := s.serveFileErr(w, r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusTeapot)
 	}
@@ -637,5 +645,43 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	_, _ = w.Write(buf.Bytes())
+	return nil
+}
+
+type fileResult struct {
+	Content string `json:"content"`
+}
+
+func (s *Server) serveFileErr(w http.ResponseWriter, r *http.Request) error {
+	qvals := r.URL.Query()
+	fileStr := qvals.Get("f")
+
+	re, err := syntax.Parse("^"+regexp.QuoteMeta(fileStr)+"$", 0)
+	if err != nil {
+		return err
+	}
+
+	qs := []query.Q{
+		&query.Regexp{Regexp: re, FileName: true, CaseSensitive: true},
+	}
+	q := &query.And{Children: qs}
+	sOpts := zoekt.SearchOptions{Whole: true}
+
+	ctx := r.Context()
+	result, err := s.Searcher.Search(ctx, q, &sOpts)
+	if err != nil {
+		return err
+	}
+
+	if len(result.Files) == 0 {
+		return fmt.Errorf("could not find file: %s", fileStr)
+	}
+
+	content := string(result.Files[0].Content)
+
+	w.Header().Add("Content-Type", "application/json")
+	encoder := json.NewEncoder(w)
+	encoder.Encode(fileResult{content})
+
 	return nil
 }

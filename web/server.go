@@ -191,6 +191,7 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 	if s.HTML {
 		mux.HandleFunc("/robots.txt", s.serveRobots)
 		mux.HandleFunc("/search", s.serveSearch)
+		mux.HandleFunc("/magicsearch", s.serveMagicSearch)
 		mux.HandleFunc("/", s.serveSearchBox)
 		mux.HandleFunc("/about", s.serveAbout)
 		mux.HandleFunc("/print", s.servePrint)
@@ -249,6 +250,18 @@ func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write(buf.Bytes())
+}
+
+func (s *Server) serveMagicSearch(w http.ResponseWriter, r *http.Request) {
+	results, err := s.serveMagicSearchErr(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusTeapot)
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	encoder := json.NewEncoder(w)
+	encoder.Encode(results)
 }
 
 func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
@@ -345,6 +358,110 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 
 	res.Last.Debug = debugScore
 	return &ApiSearchResult{Result: &res}, nil
+}
+
+type magicSearchRequest struct {
+	Query      string `json:"query"`
+	NumResults int    `json:"numResults,omitempty"`
+	Debug      bool   `json:"debug,omitempty"`
+}
+
+type magicSearchResponse struct {
+	Results []magicSearchResult `json:"results"`
+}
+
+type magicSearchResultFragment struct {
+	LineOffset  int    `json:"lineOffset"`
+	FileOffset  uint32 `json:"fileOffset"`
+	MatchLength int    `json:"matchLength"`
+}
+
+type magicSearchResultMatch struct {
+	LineNumber  int                         `json:"lineNumber"`
+	IsPathMatch bool                        `json:"isPathMatch"`
+	Fragments   []magicSearchResultFragment `json:"fragments"`
+}
+
+type magicSearchResult struct {
+	Repository string                   `json:"repository"`
+	Path       string                   `json:"path"`
+	Language   string                   `json:"language"`
+	Content    string                   `json:"content"`
+	Matches    []magicSearchResultMatch `json:"matches"`
+}
+
+// serveMagicSearchErr handles POST requests for search with JSON input/output
+func (s *Server) serveMagicSearchErr(r *http.Request) (*magicSearchResponse, error) {
+	if r.Method != http.MethodPost {
+		return nil, fmt.Errorf("method not allowed: %s", r.Method)
+	}
+
+	var req magicSearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return nil, fmt.Errorf("invalid JSON request: %v", err)
+	}
+	defer r.Body.Close()
+
+	if req.Query == "" {
+		return nil, fmt.Errorf("no query found")
+	}
+
+	q, err := query.Parse(req.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	sOpts := zoekt.SearchOptions{
+		MaxWallTime: 10 * time.Second,
+		Whole:       true,
+	}
+
+	sOpts.SetDefaults()
+	sOpts.MaxDocDisplayCount = req.NumResults
+	sOpts.DebugScore = req.Debug
+
+	ctx := r.Context()
+	if err := zjson.CalculateDefaultSearchLimits(ctx, q, s.Searcher, &sOpts); err != nil {
+		return nil, err
+	}
+
+	result, err := s.Searcher.Search(ctx, q, &sOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]magicSearchResult, 0, len(result.Files))
+	for _, file := range result.Files {
+		matches := make([]magicSearchResultMatch, 0, len(file.LineMatches))
+
+		for _, lineMatch := range file.LineMatches {
+			fragments := make([]magicSearchResultFragment, 0, len(lineMatch.LineFragments))
+			for _, fragment := range lineMatch.LineFragments {
+				fragments = append(fragments, magicSearchResultFragment{
+					LineOffset:  fragment.LineOffset,
+					FileOffset:  fragment.Offset,
+					MatchLength: fragment.MatchLength,
+				})
+			}
+
+			matches = append(matches, magicSearchResultMatch{
+				LineNumber:  lineMatch.LineNumber,
+				IsPathMatch: lineMatch.FileName,
+				Fragments:   fragments,
+			})
+		}
+
+		fileNameParts := strings.SplitN(file.FileName, "/", 3)
+		results = append(results, magicSearchResult{
+			Repository: fmt.Sprintf("%s/%s", fileNameParts[0], fileNameParts[1]),
+			Path:       fileNameParts[2],
+			Language:   file.Language,
+			Content:    string(file.Content),
+			Matches:    matches,
+		})
+	}
+
+	return &magicSearchResponse{Results: results}, nil
 }
 
 func (s *Server) servePrint(w http.ResponseWriter, r *http.Request) {
@@ -654,9 +771,11 @@ type fileResult struct {
 
 func (s *Server) serveFileErr(w http.ResponseWriter, r *http.Request) error {
 	qvals := r.URL.Query()
-	fileStr := qvals.Get("f")
+	repositoryStr := qvals.Get("repository")
+	pathStr := qvals.Get("path")
 
-	re, err := syntax.Parse("^"+regexp.QuoteMeta(fileStr)+"$", 0)
+	filePath := fmt.Sprintf("%s/%s", repositoryStr, pathStr)
+	re, err := syntax.Parse("^"+regexp.QuoteMeta(filePath)+"$", 0)
 	if err != nil {
 		return err
 	}
@@ -674,7 +793,7 @@ func (s *Server) serveFileErr(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if len(result.Files) == 0 {
-		return fmt.Errorf("could not find file: %s", fileStr)
+		return fmt.Errorf("could not find file: %s", filePath)
 	}
 
 	content := string(result.Files[0].Content)

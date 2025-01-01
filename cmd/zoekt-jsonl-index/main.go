@@ -5,7 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"path/filepath"
+	"strings"
 
+	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 )
 
@@ -64,10 +67,26 @@ func indexFile(ctx context.Context, builder *build.Builder, path string) error {
 	}
 
 	for _, entry := range fileEntries {
-		if err := builder.AddFile(fmt.Sprintf("%s/%s", entry.Repository, entry.FilePath), []byte(entry.Content)); err != nil {
+		err := builder.Add(zoekt.Document{
+			Name:     fmt.Sprintf("%s/%s", entry.Repository, entry.FilePath),
+			Language: getLanguageFromPath(path),
+			Content:  []byte(entry.Content)},
+		)
+		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func getLanguageFromPath(path string) string {
+	fileName := filepath.Base(path)
+
+	parts := strings.Split(fileName, "_")
+	if len(parts) > 0 {
+		return strings.ToLower(parts[0])
+	}
+
+	return ""
 }

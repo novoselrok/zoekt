@@ -50,6 +50,7 @@ func main() {
 		log.Printf("Indexing %d files from dir %s", len(paths), *dir)
 
 		for _, path := range paths {
+			log.Printf("Indexing %s", path)
 			err = indexFile(ctx, builder, path)
 			if err != nil {
 				log.Fatal(err)
